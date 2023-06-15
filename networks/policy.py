@@ -5,6 +5,18 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 
 
+def init_params(net):
+    for m in net.modules():
+        if (isinstance(m, (nn.Conv2d, nn.ConvTranspose2d))):
+            nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+
+def get_init_hidden_state(batch_size, hidden_dim, device):
+    return torch.zeros(1, batch_size, hidden_dim).to(device), torch.zeros(1, batch_size, hidden_dim).to(device)
+
+
 def Conv3x3BNReLU(in_channels, out_channels, stride, groups):
     return nn.Sequential(
             nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=3, stride=stride, padding=1, groups=groups),
@@ -80,26 +92,13 @@ class DepthEncoder(nn.Module):
         self.fc = nn.Linear(256 * 7 * 7, feature_dim)
         self.ln = nn.LayerNorm(feature_dim)
 
+        init_params(self)
+
     def _make_layer(self, in_channels, out_channels, groups, block_num):
         layers = [ShuffleNetUnits(in_channels, out_channels, stride=2, groups=groups)]
         for i in range(1, block_num):
             layers.append(ShuffleNetUnits(out_channels, out_channels, stride=1, groups=groups))
         return nn.Sequential(*layers)
-
-    def init_params(self):
-        for m in self.modules():
-            """Custom weight init for Conv2D and Linear layers."""
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight.data)
-                m.bias.data.fill_(0.0)
-            elif isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
-                # delta-orthogonal init from https://arxiv.org/pdf/1806.05393.pdf
-                assert m.weight.size(2) == m.weight.size(3)
-                m.weight.data.fill_(0.0)
-                m.bias.data.fill_(0.0)
-                mid = m.weight.size(2) // 2
-                gain = nn.init.calculate_gain('relu')
-                nn.init.orthogonal_(m.weight.data[:, :, mid, mid], gain)
 
     def forward(self, depth, detach=False):
         bs = depth.size(0)
@@ -122,8 +121,7 @@ class DepthEncoder(nn.Module):
             h = h.view(bs * seq_len, -1)
         else:
             h = h.view(bs, -1)
-        h = self.fc(h)
-        h = torch.tanh(self.ln(h))
+        h = F.relu6(self.fc(h), inplace=True)
 
         if is_seq:
             h = h.view(bs, seq_len, -1)
@@ -136,12 +134,19 @@ class DepthDecoder(nn.Module):
         super().__init__()
         self.feature_dim = feature_dim
         self.fc = nn.Linear(feature_dim, 256 * 7 * 7)
-        self.relu = nn.ReLU6(inplace=True)
 
-        self.upsampling1 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1)
-        self.upsampling2 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1)
-        self.upsampling3 = nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1)
-        self.upsampling4 = nn.ConvTranspose2d(32, 1, kernel_size=8, stride=4, padding=2)
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
+            nn.ReLU6(True),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.ReLU6(True),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
+            nn.ReLU6(True),
+            nn.ConvTranspose2d(32, 1, kernel_size=8, stride=4, padding=2),
+            nn.Sigmoid()
+        )
+
+        init_params(self)
 
     def forward(self, h):
         bs = h.size(0)
@@ -150,16 +155,15 @@ class DepthDecoder(nn.Module):
             is_seq = True
             seq_len = h.size(1)
             h = h.view(-1, self.feature_dim)
-        h = self.relu(self.fc(h))
+        h = F.relu6(self.fc(h), inplace=True)
         
         h = h.view(-1, 256, 7, 7)
-        h = self.upsampling1(h)
-        h = self.upsampling2(h)
-        h = self.upsampling3(h)
-        recon = self.upsampling4(h)
+        recon = self.decoder(h)
+
+        c, h, w = recon.size(1), recon.size(2), recon.size(3)
 
         if is_seq:
-            recon = recon.view(bs, seq_len, recon.size(1), recon.size(2), recon.size(3))
+            recon = recon.view(bs, seq_len, c, h, w)
         return recon
     
 
@@ -176,13 +180,13 @@ class StateEncoder(nn.Module):
         return out
     
 
-class NNPlanner(nn.Module):
+class NNPlanner(nn.Module): # TODO: to modify based on policy_simple_avg_pool.py
     def __init__(self, state_dim, action_dim, groups=2, feature_dim=128, hidden_dim=128):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.depth_encoder = DepthEncoder(groups, feature_dim)
         self.depth_decoder = DepthDecoder(feature_dim)
-        self.state_encoder = StateEncoder(state_dim)
+        self.state_encoder = StateEncoder(state_dim, feature_dim)
         self.policy_net = nn.Sequential(
             nn.Linear(hidden_dim, 256), nn.ReLU(True),
             nn.Linear(256, 256), nn.ReLU(True),
@@ -190,21 +194,13 @@ class NNPlanner(nn.Module):
         )
         self.lstm = nn.LSTM(2*feature_dim, hidden_dim, batch_first=True)
 
-    def plan(self, depth, state, h, c, detach=False):
+    def forward(self, depth, state, h, c, detach=False):
         hv = self.depth_encoder(depth, detach=detach)
         hs = self.state_encoder(state)
         hvs = torch.cat([hv, hs], dim=-1)
         out, (new_h, new_c) = self.lstm(hvs, (h, c))
         action = self.policy_net(out)
         return action, (new_h, new_c)
-
-    def encode_decode(self, depth):
-        hv = self.depth_encoder(depth)
-        recon = self.depth_decoder(hv)
-        return hv, recon
-
-    def get_init_hidden_state(self, batch_size, device):
-        return torch.zeros(1, batch_size, self.hidden_dim).to(device), torch.zeros(1, batch_size, self.hidden_dim).to(device)
 
 
 if __name__ == "__main__":
