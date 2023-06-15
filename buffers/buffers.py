@@ -8,25 +8,50 @@ from scipy.spatial.transform import Rotation as R
 
 
 class ReplayBuffer(object):
-    def __init__(self, dataset_path, device=None, n_steps=10, mode="bc", use_rel_goal=True, use_future_pva=True):
+    def __init__(self, dataset_path, device=None, n_steps=10, mode="bc", use_global_frame=False, use_future_pva=True, norm_goal_by_horizon=True, mask_file="mask.png",
+                 use_attitude=True, use_angvel=True):
         self._dataset_path = dataset_path
-        if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self.device = device
+        self.device = torch.device("cpu") if device is None else device
         self._n_steps = n_steps
         self._mode = mode
         self._use_future_pva = use_future_pva
-        self._use_rel_goal = use_rel_goal
+        self._use_global_frame = use_global_frame
+        self._norm_goal_by_horizon = norm_goal_by_horizon
         self._n_eps = None
+        self._mask_path = os.path.join(os.path.dirname(__file__), mask_file) if mask_file is not None else None
+        self._use_attitude = use_attitude
+        self._use_angvel = use_angvel
         self._init_configs()
         self._init_buffer()
 
     def compute_state_action_dim(self):
-        if self._use_rel_goal:
-            return 14, 9
+        act_dim = 9
+        if self._use_global_frame:
+            if self._use_attitude:
+                if self._use_angvel:
+                    state_dim = 16
+                else:
+                    state_dim = 13
+            else:
+                state_dim = 9
         else:
-            return 16, 9
+            if self._norm_goal_by_horizon:
+                if self._use_attitude:
+                    if self._use_angvel:
+                        state_dim = 14
+                    else:
+                        state_dim = 11
+                else:
+                    state_dim = 7
+            else:
+                if self._use_attitude:
+                    if self._use_angvel:
+                        state_dim = 13
+                    else:
+                        state_dim = 10
+                else:
+                    state_dim = 6
+        return state_dim, act_dim
 
     def _init_configs(self):
         config_path = os.path.join(self._dataset_path, "config.yml")
@@ -46,22 +71,23 @@ class ReplayBuffer(object):
         self.max_step_dist = self.max_vel * self.Tf
 
     def _init_buffer(self, shuffle=True):
-        self._eps_paths = np.array(
-            sorted(
+        self._eps_paths = sorted(
                 [os.path.join(self._dataset_path, ep) for ep in os.listdir(self._dataset_path) if re.search(r"\d+$", ep) is not None], 
-                key=lambda x: re.search(r"\d+$", x).group(0)
-            ),
-            dtype=np.str_
+                key=lambda x: int(re.search(r"\d+$", x).group(0))
         )
-        self._n_eps = len(self._eps_paths)
+        to_remove = [ep for ep in self._eps_paths if len(os.listdir(ep))-1 < self._n_steps]
+        for ep in to_remove:
+            self._eps_paths.remove(ep)
+        self._eps_paths = np.array(self._eps_paths, dtype=np.str_)
         self._eps_lengths = np.array(
             [len(os.listdir(ep))-1 for ep in self._eps_paths]
-        ) # Do not consider last obs
+        )       
+        self._n_eps = len(self._eps_paths)
         self._min_lookup_len = min(self._n_steps, self._eps_lengths.min())
         indices = np.arange(self._n_eps)
         if shuffle:
             np.random.shuffle(indices)
-        self._train_n_eps = int(0.7 * self._n_eps)
+        self._train_n_eps = int(0.8 * self._n_eps)
         self._val_n_eps = int(0.2 * self._n_eps)
         self._test_n_eps = self._n_eps - self._train_n_eps - self._val_n_eps
         train_inds = indices[:self._train_n_eps]
@@ -93,9 +119,13 @@ class ReplayBuffer(object):
         indices = np.arange(n_eps)
         if shuffle:
             np.random.shuffle(indices)
-        for start_idx in range(0, n_eps, batch_size):
-            end_idx = min(start_idx + batch_size, n_eps)
-            batch_indices = indices[start_idx:end_idx]
+
+        if batch_size > n_eps:
+            raise Exception(f"Batch size ({batch_size}) is larger than the number of episodes ({n_eps})")
+
+        num_batches = int(n_eps/batch_size)
+        for i in range(num_batches):
+            batch_indices = indices[i*batch_size:(i+1)*batch_size]
             batch_depths, batch_states, batch_actions = self._prepare_batch(eps_paths, eps_lengths, batch_indices)
             yield batch_depths, batch_states, batch_actions
             
@@ -141,11 +171,18 @@ class ReplayBuffer(object):
         
     def _convert(self, img, size):
         return cv2.resize(img, size)
+    
+    def _add_mask(self, img):
+        if self._mask_path is None:
+            return img
+        mask = cv2.imread(self._mask_path, cv2.IMREAD_ANYDEPTH)
+        img = np.where(mask == 0, np.ones_like(img), img)
+        return img
         
     def _load(self, step):
         # TODO: require postprocessing the reward
         data = np.load(step, allow_pickle=True).item()
-        depth = np.expand_dims(self._convert(data["observation"]["depth"], [224, 224]), 0)
+        depth = np.expand_dims(self._convert(self._add_mask(data["observation"]["depth"]), [224, 224]), 0)
         glob_pos = data["observation"]["glob_pos"]
         glob_vel = data["observation"]["glob_vel"]
         glob_quat = data["observation"]["body2glob_quat"]
@@ -168,36 +205,73 @@ class ReplayBuffer(object):
             else:
                 return depth, state
             
-    def _normalize_states(self, glob_pos, glob_vel, glob_quat, glob_angvel, glob_goal):
-        r_b2g = R.from_quat(glob_quat) # get body frame orientation from quarternion
-        if self._use_rel_goal:
-            body_rel_goal = r_b2g.apply(glob_goal-glob_pos, inverse=True)
-            body_rel_goal_dist = np.linalg.norm(body_rel_goal)
-            body_rel_goal_uvec = body_rel_goal/body_rel_goal_dist if body_rel_goal_dist > 0 else np.zeros_like(body_rel_goal)
-            norm_dist_ratio = min(body_rel_goal_dist/self.horizon, 1.0)
+    def _normalize_states(self, glob_pos, glob_vel, glob_quat, glob_angvel, glob_goal): # TODO: to add whether want to include ang velocity and orientation
+        if not self._use_global_frame:
+            r_b2g = R.from_quat(glob_quat) # get body frame orientation from quarternion
             body_vel = r_b2g.apply(glob_vel, inverse=True)
             norm_body_vel = body_vel / self.max_vel
             body_angvel = r_b2g.apply(glob_angvel, inverse=True)
-            norm_body_angvel = body_angvel/np.linalg.norm(body_angvel) if np.linalg.norm(body_angvel) > 0 else np.zeros_like(np.zeros_like)
-            return np.hstack([norm_dist_ratio, body_rel_goal_uvec, norm_body_vel, glob_quat, norm_body_angvel]).astype(np.float32).reshape((14,))
+            norm_body_angvel = body_angvel/np.linalg.norm(body_angvel) if np.linalg.norm(body_angvel) > 0 else np.zeros_like(body_angvel)
+            if self._norm_goal_by_horizon:
+                body_rel_goal = r_b2g.apply(glob_goal-glob_pos, inverse=True)
+                body_rel_goal_dist = np.linalg.norm(body_rel_goal)
+                body_rel_goal_uvec = body_rel_goal/body_rel_goal_dist if body_rel_goal_dist > 0 else np.zeros_like(body_rel_goal)
+                norm_dist_ratio = min(body_rel_goal_dist/self.horizon, 1.0)
+                if self._use_attitude:
+                    if self._use_angvel:
+                        return np.hstack([norm_dist_ratio, body_rel_goal_uvec, norm_body_vel, glob_quat, norm_body_angvel]).astype(np.float32).reshape((14,))
+                    else:
+                        return np.hstack([norm_dist_ratio, body_rel_goal_uvec, norm_body_vel, glob_quat]).astype(np.float32).reshape((11,))
+                else:
+                    return np.hstack([norm_dist_ratio, body_rel_goal_uvec, norm_body_vel]).astype(np.float32).reshape((7,))
+            else:
+                ... # TODO: to implement state representation without using relative goal
+                body_rel_goal = r_b2g.apply(glob_goal-glob_pos, inverse=True)
+                norm_rel_goal = np.array([body_rel_goal[0]/self.map_size_x, body_rel_goal[1]/self.map_size_y, body_rel_goal[2]/self.map_size_z])
+                if self._use_attitude:
+                    if self._use_angvel:
+                        return np.hstack([norm_rel_goal, norm_body_vel, glob_quat, norm_body_angvel]).astype(np.float32).reshape((13,))
+                    else:
+                        return np.hstack([norm_rel_goal, norm_body_vel, glob_quat]).astype(np.float32).reshape((10,))
+                else:
+                    return np.hstack([norm_rel_goal, norm_body_vel]).astype(np.float32).reshape((6,))
+
         else:
-            ... # TODO: to implement state representation without using relative goal
+            ... # TODO: implement state representation w.r.t. the global frame
+            norm_pos = np.array([glob_pos[0]/(self.map_size_x/2.), glob_pos[1]/(self.map_size_y/2.), glob_pos[2]/self.map_size_z])
+            norm_goal = np.array([glob_goal[0]/(self.map_size_x/2.), glob_goal[1]/(self.map_size_y/2.), glob_goal[2]/self.map_size_z])
+            norm_vel = glob_vel/self.max_vel
+            norm_angvel = glob_angvel/np.linalg.norm(glob_angvel) if np.linalg.norm(glob_angvel) > 0 else np.zeros_like(glob_angvel)
+            if self._use_attitude:
+                if self._use_angvel:
+                    return np.hstack([norm_pos, norm_vel, glob_quat, norm_angvel, norm_goal]).astype(np.float32).reshape((16,))
+                else:
+                    return np.hstack([norm_pos, norm_vel, glob_quat, norm_goal]).astype(np.float32).reshape((13,))
+            else:
+                return np.hstack([norm_pos, norm_vel, norm_goal]).astype(np.float32).reshape((9,))
 
     def _normalize_future_actions(self, glob_pos, glob_quat, action):
-        r_b2g = R.from_quat(glob_quat) # get body frame orientation from quarternion
         p, v, a = np.hsplit(action, 3)
-        body_p = r_b2g.apply(p - glob_pos, inverse=True)
-        norm_body_p = body_p / self.max_step_dist
-        body_v = r_b2g.apply(v, inverse=True)
-        norm_body_v = body_v / self.max_vel
-        body_a = r_b2g.apply(a, inverse=True)
-        norm_body_a = body_a / self.max_acc
-        return np.hstack([norm_body_p, norm_body_v, norm_body_a]).astype(np.float32).reshape((9,))
+        if not self._use_global_frame:
+            r_b2g = R.from_quat(glob_quat) # get body frame orientation from quarternion
+            body_p = r_b2g.apply(p - glob_pos, inverse=True)
+            norm_body_p = body_p / self.max_step_dist
+            body_v = r_b2g.apply(v, inverse=True)
+            norm_body_v = body_v / self.max_vel
+            body_a = r_b2g.apply(a, inverse=True)
+            norm_body_a = body_a / self.max_acc
+            return np.hstack([norm_body_p, norm_body_v, norm_body_a]).astype(np.float32).reshape((9,))
+        else:
+            ... # TODO: implement action representation w.r.t. the global frame
+            norm_p = np.array([p[0]/self.map_size_x, p[1]/self.map_size_y, p[2]/self.map_size_z])
+            norm_v = v/self.max_vel
+            norm_a = v/self.max_acc
+            return np.hstack([norm_p, norm_v, norm_a]).astype(np.float32).reshape((9,))
 
 
 if __name__ == "__main__":
     import time
-    dataset_path = "/home/jiawei/Projects/test_projects/e2e/sample"
-    rp_buffer = ReplayBuffer(dataset_path)
+    dataset_path = "/home/tlabstaff/catkin_ws_fastplanner_unity/data/dataset1"
+    rp_buffer = ReplayBuffer(dataset_path, n_steps=5)
     for batch in rp_buffer.sample(3):
         depths, states, actions = batch
